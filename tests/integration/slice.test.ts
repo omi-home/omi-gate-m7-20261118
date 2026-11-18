@@ -502,6 +502,19 @@ test("critical security finding escalates to the PO at once", () => {
   assert.equal(s.agents.calls.length, 3); // no rework round
 });
 
+test("PO resume after a critical finding re-runs the Security Reviewer, not its old report (#123)", () => {
+  const s = setup({ security: "CRITICAL" }, delivery({ security: true }));
+  assert.equal(runSlice(s.deps, s.target).state, "WAITING_PO");
+  repo.advanceRun(s.db, "run", { type: "PO_RESUME" });
+  assert.equal(runSlice(s.deps, s.target).state, "WAITING_PO");
+  const sec = s.agents.packets.filter((p) => p.role === "security-reviewer");
+  assert.deepEqual(
+    sec.map((p) => p.attempt),
+    [1, 2],
+  );
+  assert.equal(roles(s.agents.calls).filter((r) => r === "code-reviewer").length, 1);
+});
+
 test("Bug Resolution: a fix without a regression test is a failed gate, not a review", () => {
   const s = setup(
     { addsTestFrom: "implement-fix1" },
@@ -620,6 +633,23 @@ test("release validation: uncommitted work is a QA failure the engineer fixes", 
 test("Manual QA BLOCKED stops for a person", () => {
   const s = setup({ qa: ["BLOCKED"] }, delivery({ manualQa: true }));
   assert.equal(runSlice(s.deps, s.target).state, "BLOCKED");
+});
+
+test("agent BLOCKED → unblock → run: that step runs again, PASSED steps replay (#123)", () => {
+  const s = setup({ qa: ["BLOCKED", "PASSED"] }, delivery({ manualQa: true }));
+  assert.equal(runSlice(s.deps, s.target).state, "BLOCKED");
+  assert.equal(repo.runContext(s.db, "run").resumeFrom, "IN_QA");
+  repo.advanceRun(s.db, "run", { type: "UNBLOCK" });
+  assert.equal(runSlice(s.deps, s.target).state, "PR_PENDING");
+  const qa = s.agents.packets.filter((p) => p.role === "manual-qa-engineer");
+  assert.deepEqual(
+    qa.map((p) => [p.stepId, p.attempt]),
+    [
+      ["qa", 1],
+      ["qa", 2],
+    ],
+  );
+  assert.equal(roles(s.agents.calls).filter((r) => r === "code-reviewer").length, 1);
 });
 
 test("Manual QA technical failure: unblocked run resumes in QA and still gets checks (#121)", () => {
