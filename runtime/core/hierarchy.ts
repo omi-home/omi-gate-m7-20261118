@@ -25,17 +25,20 @@ export const loadHierarchy = (): Hierarchy =>
 export interface Link {
   number: number;
   type: IssueType | undefined;
+  /** `owner/repo` when the chain crosses repositories; numbers alone collide there. */
+  repo?: string;
 }
 
-/** `self` and its ancestors (nearest parent first) against the matrix, depth and cycles. */
+/** `self` (number 0: not created yet) and its ancestors (nearest parent first) against the matrix, depth and cycles. */
 export function hierarchyChecks(self: Link, ancestors: Link[], h: Hierarchy): Check[] {
   const chain = [self, ...ancestors];
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   for (const l of chain) {
-    if (seen.has(l.number)) {
+    const key = `${l.repo?.toLowerCase() ?? ""}#${l.number}`;
+    if (seen.has(key)) {
       return [fail("hierarchy", `cycle: #${l.number} is its own ancestor`)];
     }
-    seen.add(l.number);
+    seen.add(key);
   }
   for (let i = 1; i < chain.length; i++) {
     const [child, parent] = [chain[i - 1] as Link, chain[i] as Link];
@@ -44,7 +47,7 @@ export function hierarchyChecks(self: Link, ancestors: Link[], h: Hierarchy): Ch
       return [
         fail(
           "hierarchy",
-          `#${child.number} (${child.type}) cannot be a child of #${parent.number} (${parent.type})`,
+          `${child.number ? `#${child.number}` : "the new Issue"} (${child.type}) cannot be a child of #${parent.number} (${parent.type})`,
         ),
       ];
     }
@@ -65,10 +68,22 @@ export const titleType = (t: IssueType): string =>
 
 export const TITLE_PREFIX = /^([A-Za-z]+)-(\d{4})-/;
 
-export function titleCheck(title: string, type: IssueType): Check {
+/** The one valid `type:*` label of an Issue; undefined when missing, several or unknown. */
+export function labelType(labels: { name: string }[]): IssueType | undefined {
+  const t = labels.map((l) => /^type:(.+)$/.exec(l.name)?.[1]).filter(Boolean);
+  return t.length === 1 ? IssueType.safeParse(t[0]).data : undefined;
+}
+
+/** `TITLE_PREFIX` match of `title` when its prefix is `type`'s. */
+export function numberedAs(title: string, type: IssueType): RegExpExecArray | null {
   const m = TITLE_PREFIX.exec(title);
+  return m?.[1] === titleType(type) ? m : null;
+}
+
+export function titleCheck(title: string, type: IssueType): Check {
+  const m = numberedAs(title, type);
   const want = titleType(type);
-  if (m?.[1] === want) return { name: "title", status: "pass", detail: `${want}-${m[2]}` };
+  if (m) return { name: "title", status: "pass", detail: `${want}-${m[2]}` };
   return fail("title", `title must start with ${want}-<NNNN>- (label type:${type})`);
 }
 
