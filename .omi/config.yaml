@@ -1,0 +1,8 @@
+# Written by `omi github project init`. Add this repo's checks (lint/build/test commands)
+# before `omi task run`; see runtime/core/config.ts for every setting and its default.
+github:
+  owner: "omi-home"
+  repo: "omi-gate-m7-20261118"
+  projectNumber: 3
+checks:
+  test: { run: npm test }
