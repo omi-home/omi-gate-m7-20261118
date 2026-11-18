@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import { z } from "zod";
-import { type Check, IssueType, parseContract } from "./contracts.ts";
+import { type Check, IssueType, type ProjectStatus, parseContract } from "./contracts.ts";
 
 export const Hierarchy = z.strictObject({
   maxDepth: z.int().min(1),
@@ -93,3 +93,46 @@ const fail = (name: string, detail: string): Check => ({
   code: "TICKET_INVALID",
   detail,
 });
+
+// --- completion roll-up policy (DevTask-0029 #60) ---------------------------------------------
+
+/**
+ * A sub-issue as roll-up sees it. `status`: its Status in the configured Project; null when it is
+ * not on it (or has none); "unknown" when it cannot be told (unread item, option OMI does not know).
+ */
+export interface Child {
+  ref: string;
+  state: "OPEN" | "CLOSED";
+  /** GitHub close reason: COMPLETED, NOT_PLANNED, DUPLICATE, REOPENED or null. */
+  stateReason: string | null;
+  status: ProjectStatus | "unknown" | null;
+}
+
+export type RollUp = { ready: true } | { ready: false; reason: string };
+
+/**
+ * Whether a parent may roll up (close / move on): every child closed AND accepted — Status Done or
+ * Cancelled in the Project; a child outside the Project is judged by its close reason — and at
+ * least one child really done (all cancelled: a person decides). Children GitHub did not return
+ * (`total` above the page) are unverified, so no roll-up. Never closes anything itself.
+ */
+export function rollUp(children: Child[], total: number): RollUp {
+  const no = (reason: string): RollUp => ({ ready: false, reason });
+  if (children.length < total) return no(`${total - children.length} child(ren) not verified`);
+  if (!children.length) return no("no children");
+  const open = children.filter((c) => c.state === "OPEN");
+  if (open.length) return no(`open: ${open.map((c) => c.ref).join(", ")}`);
+  const cancelled = (c: Child) =>
+    c.status === "Cancelled" ||
+    (c.status === null && (c.stateReason === "NOT_PLANNED" || c.stateReason === "DUPLICATE"));
+  const done = (c: Child) =>
+    c.status === "Done" || (c.status === null && c.stateReason === "COMPLETED");
+  const pending = children.filter((c) => !done(c) && !cancelled(c));
+  if (pending.length) {
+    return no(
+      `closed but not accepted: ${pending.map((c) => `${c.ref} (${c.status ?? c.stateReason ?? "no reason"})`).join(", ")}`,
+    );
+  }
+  if (!children.some(done)) return no("every child is cancelled: a person decides");
+  return { ready: true };
+}
