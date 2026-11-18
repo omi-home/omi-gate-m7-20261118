@@ -3,11 +3,11 @@
 // resumes from GitHub instead of local memory.
 import { z } from "zod";
 import type { OmiConfig } from "../../core/config.ts";
-import { type ProjectStatus, parseContract } from "../../core/contracts.ts";
+import { AuthorAssociation, type ProjectStatus, parseContract } from "../../core/contracts.ts";
 import { OmiError } from "../../core/errors/errors.ts";
 import { api } from "../../reporting/outbox.ts";
 import { redact } from "../../reporting/redact.ts";
-import { type GhRunner, graphql, spawnGh } from "./client.ts";
+import { type GhRunner, graphql, markerAuthor, RestComment, spawnGh } from "./client.ts";
 
 const MARKER = /^<!-- omi:handoff=([\w.-]+) -->/;
 /** Handoff-holding Issues read per `show`; comments read per Issue. */
@@ -23,7 +23,7 @@ export interface Handoff {
 }
 
 const SEARCH = `query($q:String!){ search(query:$q,type:ISSUE,first:${ISSUES}){ nodes{ ... on Issue{
-  number title comments(last:100){ nodes{ url body createdAt } } } } } }`;
+  number title comments(last:100){ nodes{ url body createdAt authorAssociation author{ login } } } } } } }`;
 
 const SearchData = z.strictObject({
   search: z.strictObject({
@@ -34,7 +34,13 @@ const SearchData = z.strictObject({
           title: z.string(),
           comments: z.strictObject({
             nodes: z.array(
-              z.strictObject({ url: z.string(), body: z.string(), createdAt: z.string() }),
+              z.strictObject({
+                url: z.string(),
+                body: z.string(),
+                createdAt: z.string(),
+                authorAssociation: AuthorAssociation,
+                author: z.strictObject({ login: z.string() }).nullable(),
+              }),
             ),
           }),
         }),
@@ -54,11 +60,14 @@ export function listHandoffs(config: OmiConfig, run: GhRunner = spawnGh): Handof
   // Handoffs live on Milestones; the label keeps task Issues that quote the marker out of the slots.
   const q = `repo:${owner}/${repo} label:type:milestone "omi:handoff" in:comments sort:updated-desc`;
   const found: Handoff[] = [];
+  const trusted = markerAuthor(run);
   for (const n of graphql(SEARCH, { q }, SearchData, "search handoffs", run).search.nodes) {
     if (!("number" in n)) continue;
-    for (const c of n.comments.nodes) {
+    for (const { authorAssociation, author, ...c } of n.comments.nodes) {
       const m = MARKER.exec(c.body);
-      if (m) found.push({ marker: m[1] as string, issue: n.number, title: n.title, ...c });
+      if (m && trusted(authorAssociation, author?.login)) {
+        found.push({ marker: m[1] as string, issue: n.number, title: n.title, ...c });
+      }
     }
   }
   return found.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -116,12 +125,6 @@ export function activeMilestone(config: OmiConfig, run: GhRunner = spawnGh): num
   return (active[0] as { number: number }).number;
 }
 
-const Comment = z.looseObject({
-  id: z.int().positive(),
-  html_url: z.string(),
-  body: z.string(),
-});
-
 export interface PostResult {
   marker: string;
   issue: number;
@@ -148,14 +151,20 @@ export function postHandoff(
   const { owner, repo } = config.github;
   const issue = o.issue ?? activeMilestone(config, run);
   const base = `repos/${owner}/${repo}/issues`;
+  const trusted = markerAuthor(run);
+  let searched: Handoff[] | undefined;
+  const handoffs = () => {
+    searched ??= listHandoffs(config, run);
+    return searched;
+  };
   const pages = api(
     run,
     ["--paginate", "--slurp", `${base}/${issue}/comments?per_page=100`],
     "list comments",
   );
-  const mine = parseContract(z.array(z.array(Comment)), pages, "list comments")
+  const mine = parseContract(z.array(z.array(RestComment)), pages, "list comments")
     .flat()
-    .filter((c) => MARKER.test(c.body));
+    .filter((c) => MARKER.test(c.body) && trusted(c.author_association, c.user?.login));
   const content = redact(strip(text));
   if (!content) throw new OmiError("USAGE_INVALID", "the handoff text is empty");
 
@@ -181,7 +190,7 @@ export function postHandoff(
     }
     const seen = [
       ...mine.map((c) => MARKER.exec(c.body)?.[1] ?? ""),
-      ...listHandoffs(config, run).map((h) => h.marker),
+      ...handoffs().map((h) => h.marker),
     ];
     const last = Math.max(0, ...seen.map((m) => Number(/-s(\d+)/.exec(m)?.[1] ?? 0)));
     marker = `${(o.now ?? new Date()).toLocaleDateString("sv-SE")}-s${last + 1}`;
@@ -199,6 +208,6 @@ export function postHandoff(
     `${method} handoff`,
     JSON.stringify({ body }),
   );
-  const c = parseContract(Comment, out, `${method} handoff`);
+  const c = parseContract(RestComment, out, `${method} handoff`);
   return { marker, issue, url: c.html_url, action: existing ? "updated" : "created" };
 }
