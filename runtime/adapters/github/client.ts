@@ -58,7 +58,8 @@ const GqlEnvelope = z.looseObject({
  */
 export function graphql<S extends z.ZodType>(
   query: string,
-  vars: Record<string, string | number>,
+  /** Lists and objects only with `viaStdin`. */
+  vars: Record<string, unknown>,
   schema: S,
   name: string,
   run: GhRunner = spawnGh,
@@ -69,8 +70,10 @@ export function graphql<S extends z.ZodType>(
   if (viaStdin) args.push("--input", "-");
   else {
     args.push("-f", `query=${query}`);
-    for (const [k, v] of Object.entries(vars))
-      args.push(typeof v === "number" ? "-F" : "-f", `${k}=${v}`);
+    for (const [k, v] of Object.entries(vars)) {
+      if (typeof v === "object") throw new OmiError("INTERNAL", `${name}: ${k} needs viaStdin`);
+      args.push(typeof v === "number" ? "-F" : "-f", `${k}=${String(v)}`);
+    }
   }
   const r = viaStdin ? run(args, JSON.stringify({ query, variables: vars })) : run(args);
   let body: unknown;
