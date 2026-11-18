@@ -48,6 +48,7 @@ import {
   type WorkflowEventType,
 } from "../core/contracts.ts";
 import { OmiError } from "../core/errors/errors.ts";
+import { hierarchyChecks, type Link, loadHierarchy, titleCheck } from "../core/hierarchy.ts";
 import { PRE_MERGE, PROJECT_STATUS, transition } from "../core/workflow-engine/fsm.ts";
 import { planWorkflow, type WorkflowPlan } from "../core/workflow-engine/plan.ts";
 import {
@@ -94,7 +95,6 @@ const EXECUTABLE: readonly IssueType[] = [
   "devops-task",
   "documentation-task",
   "spike",
-  "bug",
 ];
 const START_LEASE_MS = 10 * 60_000;
 /** A whole review loop may run several agents back to back. */
@@ -122,6 +122,61 @@ const typeOf = (t: Ticket) => {
   return labels.length === 1 ? IssueType.safeParse(labels[0]).data : undefined;
 };
 
+/**
+ * Parent chain of `t` inside the configured repository, nearest first. Stops at a repeated
+ * Issue (a cycle, kept so the check reports it) or one level past the maximum depth.
+ * ponytail: one GraphQL call per ancestor; one nested query if deep trees get slow.
+ */
+function ancestors(config: OmiConfig, t: Ticket, gh: GhRunner, maxDepth: number): Link[] {
+  const repoName = `${config.github.owner}/${config.github.repo}`.toLowerCase();
+  const out: Link[] = [];
+  let p = t.parent;
+  while (p && p.repository.nameWithOwner.toLowerCase() === repoName && out.length < maxDepth) {
+    const n = p.number;
+    const seen = n === t.number || out.some((l) => l.number === n);
+    const parent = seen ? undefined : fetchTicket(config, n, gh);
+    out.push({ number: n, type: parent && typeOf(parent) });
+    p = parent?.parent ?? null;
+  }
+  return out;
+}
+
+/**
+ * Definition of Ready (#128): Objective section, title ↔ `type:*`, hierarchy. Checked when work
+ * starts (`task start`, `ticket validate`), not again at PR time: a run already under way keeps
+ * the rules it started with.
+ */
+function readyGates(t: Ticket, config: OmiConfig, gh: GhRunner): Check[] {
+  const checks: Check[] = [
+    /^#{1,6}\s+\W*(objectives?|mục tiêu)/imu.test(t.body.normalize("NFC"))
+      ? { name: "objective", status: "pass", detail: "objective present" }
+      : {
+          name: "objective",
+          status: "fail",
+          code: "TICKET_INVALID",
+          detail: "no Objective section",
+        },
+  ];
+  const type = typeOf(t);
+  if (!type) return checks; // the type gate reports it
+  const h = loadHierarchy();
+  checks.push(titleCheck(t.title, type));
+  try {
+    checks.push(
+      ...hierarchyChecks({ number: t.number, type }, ancestors(config, t, gh, h.maxDepth), h),
+    );
+  } catch (e) {
+    const err = e instanceof OmiError ? e : new OmiError("INTERNAL", (e as Error).message);
+    checks.push({
+      name: "hierarchy",
+      status: "fail",
+      code: err.code,
+      detail: `cannot read the parent chain: ${err.message}`,
+    });
+  }
+  return checks;
+}
+
 /** Ticket gates plus "may this Issue own a worktree" (spec §6: work happens on terminal tasks). */
 export function startGates(t: Ticket, config: OmiConfig): Check[] {
   const checks = validateTicket(t, config);
@@ -134,7 +189,10 @@ export function startGates(t: Ticket, config: OmiConfig): Check[] {
             name: "executable",
             status: "fail",
             code: "POLICY_VIOLATION",
-            detail: `${type} issues do not get a task branch/worktree`,
+            detail:
+              type === "bug"
+                ? "a Bug is fixed through a child DevTask or TestTask: create one and start it"
+                : `${type} issues do not get a task branch/worktree`,
           },
     );
   }
@@ -144,7 +202,9 @@ export function startGates(t: Ticket, config: OmiConfig): Check[] {
 export function ticketValidate(deps: TaskDeps, issue: number): Check[] {
   // Read-only: no state database is opened or created.
   const { config } = repo(deps.cwd);
-  return startGates(fetchTicket(config, issue, deps.gh ?? spawnGh), config);
+  const gh = deps.gh ?? spawnGh;
+  const t = fetchTicket(config, issue, gh);
+  return [...startGates(t, config), ...readyGates(t, config, gh)];
 }
 
 function step(db: Db, r: RunRow, type: Exclude<WorkflowEventType, "TECHNICAL_FAILURE">): RunRow {
@@ -170,7 +230,7 @@ export function taskStart(deps: TaskDeps, issue: number): StartResult {
     acquireLease(db, { key: lease, holder: session, ttlMs: START_LEASE_MS });
     try {
       const ticket = fetchTicket(config, issue, gh);
-      const checks = startGates(ticket, config);
+      const checks = [...startGates(ticket, config), ...readyGates(ticket, config, gh)];
       const bad = checks.find((c) => c.status === "fail");
       if (bad) {
         throw new OmiError(bad.code ?? "TICKET_INVALID", `${bad.name}: ${bad.detail}`, {
