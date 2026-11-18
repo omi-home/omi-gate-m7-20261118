@@ -1,0 +1,6 @@
+{
+  "name": "omi-e2e-workload",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}
