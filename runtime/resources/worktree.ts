@@ -56,12 +56,20 @@ const PREFIX: Partial<Record<IssueType, string>> = {
   "test-task": "test",
   "devops-task": "chore",
 };
+/** Prefix taken from the owning ancestor: tasks that fix a Bug (PO 2026-11-18, #132). */
+const PARENT_PREFIX: Partial<Record<IssueType, string>> = { bug: "bugfix" };
 
 /**
  * `<prefix>/<issue>-<slug>` (spec §7); slug is ASCII, at most 40 chars, without the title's
- * `<IssueType>-<NNNN>-` prefix (already in the issue number).
+ * `<IssueType>-<NNNN>-` prefix (already in the issue number). `owner` is the nearest non-task
+ * ancestor's type; it only changes the prefix (PARENT_PREFIX), not the run's workflow.
  */
-export function branchName(type: IssueType, issue: number, title: string): string {
+export function branchName(
+  type: IssueType,
+  issue: number,
+  title: string,
+  owner?: IssueType,
+): string {
   const slug = title
     .replace(new RegExp(`^${titleType(type)}-\\d{4}-`), "")
     .replace(/[đĐ]/g, "d") // NFKD does not decompose đ
@@ -71,7 +79,8 @@ export function branchName(type: IssueType, issue: number, title: string): strin
     .replace(/[^a-z0-9]+/g, "-")
     .slice(0, 40)
     .replace(/^-+|-+$/g, "");
-  return `${PREFIX[type] ?? "feature"}/${issue}${slug ? `-${slug}` : ""}`;
+  const prefix = (owner && PARENT_PREFIX[owner]) ?? PREFIX[type] ?? "feature";
+  return `${prefix}/${issue}${slug ? `-${slug}` : ""}`;
 }
 
 export function git(args: string[], cwd: string): string {
